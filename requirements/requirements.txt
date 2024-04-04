@@ -1,8 +1,8 @@
-beautifulsoup4>=4.8
-requests>=2
-diot>=0.1.5
-PyYAML>=5.0
-tqdm>=4.42.0
-pandas>=1.2
-lxml>=4
-urllib3==1.26
+beautifulsoup4>=4.12.3
+requests>=2.31.0
+diot>=0.2.3
+PyYAML>=6.0.1
+tqdm>=4.66.2
+pandas>=2.2.1
+lxml>=5.2.1
+urllib3==2.2.1
