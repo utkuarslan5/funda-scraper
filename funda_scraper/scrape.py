@@ -2,18 +2,23 @@
 import argparse
 import datetime
 import json
-import multiprocessing as mp
+import asyncio
+import random
 import os
 from typing import List, Optional
 
 import pandas as pd
+import aiofiles
+import aiohttp
 import requests
+from io import StringIO
 from bs4 import BeautifulSoup
+from tqdm.asyncio import tqdm as atqdm
 from tqdm import tqdm
 from tqdm.contrib.concurrent import process_map
 
 from funda_scraper.config.core import config
-from funda_scraper.preprocess import clean_date_format, preprocess_data
+from funda_scraper.preprocess import clean_date_format, async_preprocess_data
 from funda_scraper.utils import logger
 
 
@@ -21,7 +26,6 @@ class FundaScraper(object):
     """
     Handles the main scraping function.
     """
-
     def __init__(
         self,
         area: str,
@@ -54,54 +58,14 @@ class FundaScraper(object):
         self.selectors = config.css_selector
 
     def __repr__(self):
-        return (
-            f"FundaScraper(area={self.area}, "
+        return (f"FundaScraper(area={self.area}, "
             f"want_to={self.want_to}, "
             f"n_pages={self.n_pages}, "
             f"page_start={self.page_start}, "
-            f"find_past={self.find_past})"
-            f"min_price={self.min_price})"
-            f"max_price={self.max_price})"
-            f"days_since={self.days_since})"
-        )
-
-    @property
-    def to_buy(self) -> bool:
-        """Whether to buy or not"""
-        if self.want_to.lower() in ["buy", "koop", "b", "k"]:
-            return True
-        elif self.want_to.lower() in ["rent", "huur", "r", "h"]:
-            return False
-        else:
-            raise ValueError("'want_to' must be either 'buy' or 'rent'.")
-
-    @property
-    def check_days_since(self) -> int:
-        """Whether days since complies"""
-        if self.find_past:
-            raise ValueError("'days_since' can only be specified when find_past=False.")
-
-        if self.days_since in [None, 1, 3, 5, 10, 30]:
-            return self.days_since
-        else:
-            raise ValueError("'days_since' must be either None, 1, 3, 5, 10 or 30.")
-
-    @staticmethod
-    def _check_dir() -> None:
-        """Check whether a temporary directory for data"""
-        if not os.path.exists("data"):
-            os.makedirs("data")
-
-    @staticmethod
-    def _get_links_from_one_parent(url: str) -> List[str]:
-        """Scrape all the available housing items from one Funda search page."""
-        response = requests.get(url, headers=config.header)
-        soup = BeautifulSoup(response.text, "lxml")
-
-        script_tag = soup.find_all("script", {"type": "application/ld+json"})[0]
-        json_data = json.loads(script_tag.contents[0])
-        urls = [item["url"] for item in json_data["itemListElement"]]
-        return list(set(urls))
+            f"find_past={self.find_past}, " 
+            f"min_price={self.min_price}, "
+            f"max_price={self.max_price}, "
+            f"days_since={self.days_since})")
 
     def reset(
         self,
@@ -135,33 +99,33 @@ class FundaScraper(object):
         if days_since is not None:
             self.days_since = days_since
 
-    def fetch_all_links(self, page_start: int = None, n_pages: int = None) -> None:
-        """Find all the available links across multiple pages."""
+    @property
+    def to_buy(self) -> bool:
+        """Whether to buy or not"""
+        if self.want_to.lower() in ["buy", "koop", "b", "k"]:
+            return True
+        elif self.want_to.lower() in ["rent", "huur", "r", "h"]:
+            return False
+        else:
+            raise ValueError("'want_to' must be either 'buy' or 'rent'.")
 
-        page_start = self.page_start if page_start is None else page_start
-        n_pages = self.n_pages if n_pages is None else n_pages
+    @property
+    def check_days_since(self) -> int:
+        """Whether days since complies"""
+        if self.find_past:
+            raise ValueError("'days_since' can only be specified when find_past=False.")
 
-        logger.info("*** Phase 1: Fetch all the available links from all pages *** ")
-        urls = []
-        main_url = self._build_main_query_url()
+        if self.days_since in [None, 1, 3, 5, 10, 30]:
+            return self.days_since
+        else:
+            raise ValueError("'days_since' must be either None, 1, 3, 5, 10 or 30.")
 
-        for i in tqdm(range(page_start, page_start + n_pages)):
-            try:
-                item_list = self._get_links_from_one_parent(
-                    f"{main_url}&search_result={i}"
-                )
-                urls += item_list
-            except IndexError:
-                self.page_end = i
-                logger.info(f"*** The last available page is {self.page_end} ***")
-                break
-
-        urls = list(set(urls))
-        logger.info(
-            f"*** Got all the urls. {len(urls)} houses found from {self.page_start} to {self.page_end} ***"
-        )
-        self.links = urls
-
+    @staticmethod
+    def _check_dir() -> None:
+        """Check whether a temporary directory for data"""
+        if not os.path.exists("data"):
+            os.makedirs("data")
+    
     def _build_main_query_url(self) -> str:
         query = "koop" if self.to_buy else "huur"
 
@@ -199,91 +163,155 @@ class FundaScraper(object):
             result = "na"
         return result
 
-    def scrape_one_link(self, link: str) -> List[str]:
+    @staticmethod
+    async def _get_links_from_one_parent(url: str) -> List[str]:
+        """Scrape all the available housing items from one Funda search page."""
+        try:
+            async with aiohttp.ClientSession(headers=config.header) as session:
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        logger.error(f"Failed to fetch {url}: HTTP {response.status}")
+                        return []
+                    response_text = await response.text()
+                    
+                    # Introduce a random delay
+                    await asyncio.sleep(random.uniform(0.5, 2))
+
+            soup = BeautifulSoup(response_text, "lxml")
+            script_tags = soup.find_all("script", {"type": "application/ld+json"})
+            if not script_tags:
+                logger.warning(f"No script tags found in {url}")
+                return []
+
+            json_data = json.loads(script_tags[0].contents[0])
+            urls = [item["url"] for item in json_data["itemListElement"]]
+            return list(set(urls))
+
+        except Exception as e:
+            logger.error(f"Error fetching links from {url}: {e}")
+            return []
+
+
+    async def fetch_all_links(self, page_start: int = None, n_pages: int = None) -> None:
+        """Find all the available links across multiple pages asynchronously."""
+
+        page_start = self.page_start if page_start is None else page_start
+        n_pages = self.n_pages if n_pages is None else n_pages
+
+        logger.info("*** Phase 1: Fetch all the available links from all pages *** ")
+        main_url = self._build_main_query_url()
+
+        tasks = []
+        for i in range(page_start, page_start + n_pages):
+            url = f"{main_url}&search_result={i}"
+            tasks.append(self._get_links_from_one_parent(url))
+
+        urls = []
+        async for item_list in atqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Fetching Links"):
+            try:
+                urls += await item_list
+            except IndexError:
+                self.page_end = i
+                logger.info(f"*** The last available page is {self.page_end} ***")
+                break
+
+        urls = list(set(urls))
+        logger.info(f"*** Got all the urls. {len(urls)} houses found from {self.page_start} to {self.page_end} ***")
+        self.links = urls
+
+
+    async def scrape_one_link(self, link: str) -> List[str]:
         """Scrape all the features from one house item given a link."""
+        try:
+            async with aiohttp.ClientSession(headers=config.header) as session:
+                async with session.get(link) as response:
+                    if response.status != 200:
+                        logger.error(f"Failed to fetch {link}: HTTP {response.status}")
+                        return []
+                    response_text = await response.text()
 
-        # Initialize for each page
-        response = requests.get(link, headers=config.header)
-        soup = BeautifulSoup(response.text, "lxml")
+            soup = BeautifulSoup(response_text, "lxml")
 
-        # Get the value according to respective CSS selectors
-        if self.to_buy:
-            if self.find_past:
-                list_since_selector = self.selectors.date_list
-            else:
-                list_since_selector = self.selectors.listed_since
-        else:
-            if self.find_past:
-                list_since_selector = ".fd-align-items-center:nth-child(9) span"
-            else:
-                list_since_selector = ".fd-align-items-center:nth-child(7) span"
-
-        result = [
-            link,
-            self.get_value_from_css(soup, self.selectors.price),
-            self.get_value_from_css(soup, self.selectors.address),
-            self.get_value_from_css(soup, self.selectors.descrip),
-            self.get_value_from_css(soup, list_since_selector),
-            self.get_value_from_css(soup, self.selectors.zip_code),
-            self.get_value_from_css(soup, self.selectors.size),
-            self.get_value_from_css(soup, self.selectors.year),
-            self.get_value_from_css(soup, self.selectors.living_area),
-            self.get_value_from_css(soup, self.selectors.kind_of_house),
-            self.get_value_from_css(soup, self.selectors.building_type),
-            self.get_value_from_css(soup, self.selectors.num_of_rooms),
-            self.get_value_from_css(soup, self.selectors.num_of_bathrooms),
-            self.get_value_from_css(soup, self.selectors.layout),
-            self.get_value_from_css(soup, self.selectors.energy_label),
-            self.get_value_from_css(soup, self.selectors.insulation),
-            self.get_value_from_css(soup, self.selectors.heating),
-            self.get_value_from_css(soup, self.selectors.ownership),
-            self.get_value_from_css(soup, self.selectors.exteriors),
-            self.get_value_from_css(soup, self.selectors.parking),
-            self.get_value_from_css(soup, self.selectors.neighborhood_name),
-            self.get_value_from_css(soup, self.selectors.date_list),
-            self.get_value_from_css(soup, self.selectors.date_sold),
-            self.get_value_from_css(soup, self.selectors.term),
-            self.get_value_from_css(soup, self.selectors.price_sold),
-            self.get_value_from_css(soup, self.selectors.last_ask_price),
-            self.get_value_from_css(soup, self.selectors.last_ask_price_m2).split("\r")[
-                0
-            ],
-        ]
-
-        # Deal with list_since_selector especially, since its CSS varies sometimes
-        if clean_date_format(result[4]) == "na":
-            for i in range(6, 16):
-                selector = f".fd-align-items-center:nth-child({i}) span"
-                update_list_since = self.get_value_from_css(soup, selector)
-                if clean_date_format(update_list_since) == "na":
-                    pass
+            # Get the value according to respective CSS selectors
+            if self.to_buy:
+                if self.find_past:
+                    list_since_selector = self.selectors.date_list
                 else:
-                    result[4] = update_list_since
+                    list_since_selector = self.selectors.listed_since
+            else:
+                if self.find_past:
+                    list_since_selector = ".fd-align-items-center:nth-child(9) span"
+                else:
+                    list_since_selector = ".fd-align-items-center:nth-child(7) span"
 
-        photos_list = [
-            p.get("data-lazy-srcset") for p in soup.select(self.selectors.photo)
-        ]
-        photos_string = ", ".join(photos_list)
+            result = [
+                link,
+                self.get_value_from_css(soup, self.selectors.price),
+                self.get_value_from_css(soup, self.selectors.address),
+                self.get_value_from_css(soup, self.selectors.descrip),
+                self.get_value_from_css(soup, list_since_selector),
+                self.get_value_from_css(soup, self.selectors.zip_code),
+                self.get_value_from_css(soup, self.selectors.size),
+                self.get_value_from_css(soup, self.selectors.year),
+                self.get_value_from_css(soup, self.selectors.living_area),
+                self.get_value_from_css(soup, self.selectors.kind_of_house),
+                self.get_value_from_css(soup, self.selectors.building_type),
+                self.get_value_from_css(soup, self.selectors.num_of_rooms),
+                self.get_value_from_css(soup, self.selectors.num_of_bathrooms),
+                self.get_value_from_css(soup, self.selectors.layout),
+                self.get_value_from_css(soup, self.selectors.energy_label),
+                self.get_value_from_css(soup, self.selectors.insulation),
+                self.get_value_from_css(soup, self.selectors.heating),
+                self.get_value_from_css(soup, self.selectors.ownership),
+                self.get_value_from_css(soup, self.selectors.exteriors),
+                self.get_value_from_css(soup, self.selectors.parking),
+                self.get_value_from_css(soup, self.selectors.neighborhood_name),
+                self.get_value_from_css(soup, self.selectors.date_list),
+                self.get_value_from_css(soup, self.selectors.date_sold),
+                self.get_value_from_css(soup, self.selectors.term),
+                self.get_value_from_css(soup, self.selectors.price_sold),
+                self.get_value_from_css(soup, self.selectors.last_ask_price),
+                self.get_value_from_css(soup, self.selectors.last_ask_price_m2).split("\r")[
+                    0
+                ],
+            ]
 
-        # Clean up the retried result from one page
-        result = [r.replace("\n", "").replace("\r", "").strip() for r in result]
-        result.append(photos_string)
-        return result
+            # Deal with list_since_selector especially, since its CSS varies sometimes
+            if clean_date_format(result[4]) == "na":
+                for i in range(6, 16):
+                    selector = f".fd-align-items-center:nth-child({i}) span"
+                    update_list_since = self.get_value_from_css(soup, selector)
+                    if clean_date_format(update_list_since) == "na":
+                        pass
+                    else:
+                        result[4] = update_list_since
 
-    def scrape_pages(self) -> None:
+            photos_list = [
+                p.get("data-lazy-srcset") for p in soup.select(self.selectors.photo)
+            ]
+            photos_string = ", ".join(photos_list)
+
+            # Clean up the retried result from one page
+            result = [r.replace("\n", "").replace("\r", "").strip() for r in result]
+            result.append(photos_string)
+            return result
+        except Exception as e:
+            logger.error(f"Error scraping {link}: {e}")
+            return None
+
+    async def scrape_pages(self) -> None:
         """Scrape all the content acoss multiple pages."""
 
         logger.info("*** Phase 2: Start scraping from individual links ***")
         df = pd.DataFrame({key: [] for key in self.selectors.keys()})
 
-        # Scrape pages with multiprocessing to improve efficiency
-        # TODO: use asynctio instead
-        pools = mp.cpu_count()
-        content = process_map(self.scrape_one_link, self.links, max_workers=pools)
-
+        # Creating async tasks for each link
+        scrape_tasks = [self.scrape_one_link(link) for link in self.links]
+        content = await asyncio.gather(*scrape_tasks)
+        
         for i, c in enumerate(content):
             df.loc[len(df)] = c
-
+            
         df["city"] = df["url"].map(lambda x: x.split("/")[4])
         df["log_id"] = datetime.datetime.now().strftime("%Y%m-%d%H-%M%S")
         if not self.find_past:
@@ -302,7 +330,7 @@ class FundaScraper(object):
         df.to_csv(filepath, index=False)
         logger.info(f"*** File saved: {filepath}. ***")
 
-    def run(
+    async def run(
         self, raw_data: bool = False, save: bool = False, filepath: str = None
     ) -> pd.DataFrame:
         """
@@ -313,14 +341,14 @@ class FundaScraper(object):
         :param filepath: the name for the file
         :return: the (pre-processed) dataframe from scraping
         """
-        self.fetch_all_links()
-        self.scrape_pages()
+        await self.fetch_all_links()
+        await self.scrape_pages()
 
         if raw_data:
             df = self.raw_df
         else:
             logger.info("*** Cleaning data ***")
-            df = preprocess_data(df=self.raw_df, is_past=self.find_past)
+            df = await async_preprocess_data(df=self.raw_df, is_past=self.find_past)
             self.clean_df = df
 
         if save:
@@ -329,7 +357,21 @@ class FundaScraper(object):
         logger.info("*** Done! ***")
         return df
 
+async def main():
+    scraper = FundaScraper(
+        area=args.area,
+        want_to=args.want_to,
+        find_past=args.find_past,
+        page_start=args.page_start,
+        n_pages=args.n_pages,
+        min_price=args.min_price,
+        max_price=args.max_price,
+        days_since=args.days_since,
+    )
 
+    df = await scraper.run(raw_data=args.raw_data, save=args.save)
+    print(df.head())
+    
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -392,5 +434,5 @@ if __name__ == "__main__":
         max_price=args.max_price,
         days_since=args.days_since,
     )
-    df = scraper.run(raw_data=args.raw_data, save=args.save)
-    print(df.head())
+    # Run the scraper within an async context
+    asyncio.run(main())

@@ -8,6 +8,8 @@ from dateutil.parser import parse
 
 from funda_scraper.config.core import config
 
+from concurrent.futures import ThreadPoolExecutor
+import asyncio
 
 def clean_price(x: str) -> int:
     """Clean the 'price' and transform from string to integer."""
@@ -208,3 +210,9 @@ def preprocess_data(
         df["year_sold"] = df["date_sold"].apply(lambda x: x.year)
 
     return df[keep_cols].reset_index(drop=True)
+
+async def async_preprocess_data(df, is_past, keep_extra_cols=None):
+    loop = asyncio.get_running_loop()
+    with ThreadPoolExecutor() as pool:
+        # Run preprocess_data in a separate thread
+        return await loop.run_in_executor(pool, preprocess_data, df, is_past, keep_extra_cols)
